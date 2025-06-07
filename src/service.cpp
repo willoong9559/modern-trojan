@@ -1,7 +1,6 @@
 #include "service.h"
 
 #include "asio.hpp"
-#include "asio/ssl.hpp"
 #include "asio/experimental/as_tuple.hpp"
 #include "asio/experimental/awaitable_operators.hpp"
 
@@ -13,14 +12,7 @@
 #include "proto.h"
 
 using asio::ip::tcp;
-using ssl_socket = asio::ssl::stream<tcp::socket>;
-namespace ssl = asio::ssl;
-
-constexpr auto SSL_OPTIONS = (
-    ssl::context::default_workarounds | ssl::context::single_dh_use |
-    ssl::context::no_sslv2 | ssl::context::no_sslv3 |
-    ssl::context::no_tlsv1 | ssl::context::no_tlsv1_1
-);
+using asio::ip::udp;
 
 using asio::co_spawn;
 using asio::detached;
@@ -109,15 +101,6 @@ namespace common {
         co_return;
     }
 
-    template<>
-    awaitable<void> async_shutdown(ssl_socket& socket) noexcept {
-        std::error_code ec;
-        co_await socket.async_shutdown(use_await);
-        socket.next_layer().cancel(ec);
-        socket.next_layer().shutdown(tcp::socket::shutdown_send);
-        co_return;
-    }
-
     // Copy from stream1 to stream2.
     template<typename _Stream1, typename _Stream2>
     awaitable<void> forward(_Stream1& a, _Stream2& b, Slice<uint8_t> buf) noexcept {
@@ -176,11 +159,11 @@ namespace trojan_server_impl {
 #if defined(TROJAN_USE_UDP)
     awaitable<void> handle_udp(
         Server& server,
-        ssl_socket& ssl_stream,
+        tcp::socket& tcp_stream,  // Changed from ssl_socket to tcp::socket
         Slice<uint8_t> buf1, Slice<uint8_t> buf2,
         int offset
     ) noexcept {
-        udp::socket udp_socket(ssl_stream.get_executor());
+        udp::socket udp_socket(tcp_stream.get_executor());
         // first packet
         {
             std::error_code ec;
@@ -188,7 +171,7 @@ namespace trojan_server_impl {
             udp::endpoint remote_addr;
             // atyp + addr[0]
             if (offset < 2) {
-                if (co_await read_exact(ssl_stream, buf1.slice(offset, 2)) < 0) { co_return; }
+                if (co_await read_exact(tcp_stream, buf1.slice(offset, 2)) < 0) { co_return; }
             }
 
             // port + length + crlf
@@ -202,7 +185,7 @@ namespace trojan_server_impl {
 
             // read left bytes of packet header
             if (offset < more_required + 2) {
-                if (co_await read_exact(ssl_stream, buf1.slice(std::max(offset, 2), more_required)) < 0) {
+                if (co_await read_exact(tcp_stream, buf1.slice(std::max(offset, 2), more_required)) < 0) {
                     co_return;
                 }
             }
@@ -213,7 +196,7 @@ namespace trojan_server_impl {
             if (pkt_hdr.length > buffer::BUF_SIZE) { co_return; }
 
             // read payload data
-            if (co_await read_exact(ssl_stream, buf1.slice_until(pkt_hdr.length)) < 0) { co_return; }
+            if (co_await read_exact(tcp_stream, buf1.slice_until(pkt_hdr.length)) < 0) { co_return; }
 
             // resolve remote addr
             if (co_await resolve_addr(server.udp_resolver, pkt_hdr.addr, &remote_addr) < 0){ co_return; }
@@ -233,7 +216,7 @@ namespace trojan_server_impl {
         }
 
 
-        auto udp_to_tcp = [&ssl_stream, &udp_socket, buf2]() -> awaitable<void> {
+        auto udp_to_tcp = [&tcp_stream, &udp_socket, buf2]() -> awaitable<void> {
             udp::endpoint addr;
             array<uint8_t, 256> hdr_buf; 
 
@@ -249,23 +232,23 @@ namespace trojan_server_impl {
                 size_t hdr_len = pkt_hdr.encode({ hdr_buf.data(), hdr_buf.size() });
 
                 // write udp header
-                if (co_await write_all(ssl_stream, { hdr_buf.data(), hdr_len }) < 0) {
+                if (co_await write_all(tcp_stream, { hdr_buf.data(), hdr_len }) < 0) {
                     co_return;
                 }
 
                 // write udp payload
-                if (co_await write_all(ssl_stream, buf2.slice_until(recv_n)) < 0) {
+                if (co_await write_all(tcp_stream, buf2.slice_until(recv_n)) < 0) {
                     co_return;
                 }
             }
         };
 
-        auto tcp_to_udp = [&server, &ssl_stream, &udp_socket, buf1, offset]() -> awaitable<void> {
+        auto tcp_to_udp = [&server, &tcp_stream, &udp_socket, buf1, offset]() -> awaitable<void> {
             udp::endpoint remote_addr;
             trojan::UdpPacket pkt_hdr;
             while(true) {
                 // read atyp + addr[0]
-                if (co_await read_exact(ssl_stream, buf1.slice_until(2)) < 0) { co_return; }
+                if (co_await read_exact(tcp_stream, buf1.slice_until(2)) < 0) { co_return; }
                 // port + length + crlf
                 auto more_required = 2 + 2 + 2;
                 switch (buf1[0]) {
@@ -275,7 +258,7 @@ namespace trojan_server_impl {
                     default: { co_return; }
                 }
                 // read left bytes of packet header
-                if (co_await read_exact(ssl_stream, buf1.slice(2, more_required)) < 0) {
+                if (co_await read_exact(tcp_stream, buf1.slice(2, more_required)) < 0) {
                     co_return;
                 }
                 // parse packet header
@@ -284,7 +267,7 @@ namespace trojan_server_impl {
                 if (pkt_hdr.length > buffer::BUF_SIZE) { co_return; }
 
                 // read payload data
-                if (co_await read_exact(ssl_stream, buf1.slice_until(pkt_hdr.length)) < 0) { co_return; }
+                if (co_await read_exact(tcp_stream, buf1.slice_until(pkt_hdr.length)) < 0) { co_return; }
 
                 // resolve remote addr
                 if (co_await resolve_addr(server.udp_resolver, pkt_hdr.addr, &remote_addr) < 0){ co_return; }
@@ -311,16 +294,10 @@ namespace trojan_server_impl {
         Buffer<uint8_t> buffer1;
         Buffer<uint8_t> buffer2;
 
-        // ssl handshake
-        ssl_socket ssl_stream(std::move(stream), server.ssl_ctx);
-        auto [essl_hs] = co_await ssl_stream.async_handshake(ssl::stream_base::server, use_await);
-        if (essl_hs) [[unlikely]] {
-            fmt::print("ssl handshake error: {}\n", essl_hs.message()); 
-            co_return; 
-        }
-
-        // trojan request
-        auto [parsed_n, read_n] = co_await read_until_parsed(ssl_stream, buffer1.slice(), &request, 1);
+        // No SSL handshake needed - direct TCP communication
+        
+        // trojan request - read directly from TCP stream
+        auto [parsed_n, read_n] = co_await read_until_parsed(stream, buffer1.slice(), &request, 1);
         if (parsed_n < 0) [[unlikely]] {
             fmt::print("invalid trojan request\n");
             co_return;
@@ -340,7 +317,7 @@ namespace trojan_server_impl {
             if (len > 0) {
                 std::memcpy(buffer1.data(), buffer1.data() + parsed_n, len);
             }
-            co_await handle_udp(server, ssl_stream, buffer1.slice(), buffer2.slice(), len);
+            co_await handle_udp(server, stream, buffer1.slice(), buffer2.slice(), len);
 #endif
             co_return;
         }
@@ -365,10 +342,10 @@ namespace trojan_server_impl {
             co_return;
         };
 
-        // bidi copy
+        // bidi copy - forward data between client TCP stream and remote stream
         co_await(
-            forward(ssl_stream, remote_stream, buffer1.slice()) ||
-            forward(remote_stream, ssl_stream, buffer2.slice())
+            forward(stream, remote_stream, buffer1.slice()) ||
+            forward(remote_stream, stream, buffer2.slice())
         );
     }
 }
@@ -399,7 +376,7 @@ namespace service {
         co_await run_service(std::move(server), handle);
     }
 
-    // Setup a server, may throw exceptions.
+    // Setup a server, no SSL context needed
     Server build_server(io_context& ctx, ServerConfig config) {
         tcp::resolver resolver(ctx);
         tcp::endpoint listen_addr = *resolver.resolve(config.host, config.port);
@@ -409,17 +386,12 @@ namespace service {
 
         auto password = hash::sha224((uint8_t*)config.password.data(), config.password.size());
 
-        ssl::context ssl_ctx{ssl::context::sslv23_server};
-        ssl_ctx.set_options(SSL_OPTIONS);
-        ssl_ctx.use_certificate_chain_file(string(config.crt_path));
-        ssl_ctx.use_private_key_file(string(config.key_path), ssl::context::pem);
-        
+        // No SSL context needed for plaintext TCP
         return Server {
             std::move(listener),
             std::move(resolver),
             udp::resolver(ctx),
-            std::move(ssl_ctx),
-            password
+            password  // Removed SSL context parameter
         };
     }
 }

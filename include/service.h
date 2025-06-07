@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <array>
 #include "asio.hpp"
-#include "asio/ssl.hpp"
 #include "conf.h"
 
 using std::array;
@@ -18,7 +17,6 @@ namespace service {
         tcp::acceptor listen;
         tcp::resolver tcp_resolver;
         udp::resolver udp_resolver;
-        asio::ssl::context ssl_ctx;
         array<uint8_t, 56> password;
     };
 

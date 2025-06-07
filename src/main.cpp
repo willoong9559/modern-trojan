@@ -11,7 +11,7 @@ using conf::ServerConfig;
 
 constexpr string_view VERSION = "v0.1.2";
 constexpr string_view CMDUSAGE = 
-R"##(trojan -l <addr> -p <port> -k <password> -a <cert> -b <key>
+R"##(trojan -l <addr> -p <port> -k <password>
 
 OPTIONS:
     -d              daemonize
@@ -21,13 +21,13 @@ OPTIONS:
 void init(int argc, char **argv, ServerConfig *config)
 {
     int opt;
-    int required = 5;
+    int required = 3;
 
     int fdlmt = 0;
     bool daemon = false;
 
 #define STORE(ident) { config->ident = optarg; required--; break;}
-    while((opt = getopt(argc, argv, "vhdn:l:p:k:a:b:")) != -1) {
+    while((opt = getopt(argc, argv, "vhdn:l:p:k:")) != -1) {
         switch(opt) {
             default:
                 fmt::print("{}", CMDUSAGE);
@@ -52,10 +52,6 @@ void init(int argc, char **argv, ServerConfig *config)
                 STORE(port);
             case 'k':
                 STORE(password);
-            case 'a':
-                STORE(crt_path);
-            case 'b':
-                STORE(key_path);
         }
     }
 #undef STORE
