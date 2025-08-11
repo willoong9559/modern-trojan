@@ -21,6 +21,10 @@ option(UDP "Enable UDP Support" ON)
 option(STATIC_STD "Static Standard Library" ON)
 option(STATIC_BIN "Static link" OFF)
 
+if(UDP)
+    add_definitions(-DTROJAN_USE_UDP)
+endif()
+
 if(STATIC_STD)
     target_link_options(trojan PRIVATE -static-libgcc -static-libstdc++)
 endif()
