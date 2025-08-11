@@ -1,8 +1,14 @@
 #include "service.h"
 
-#include "asio.hpp"
-#include "asio/experimental/as_tuple.hpp"
-#include "asio/experimental/awaitable_operators.hpp"
+#include "boost/asio.hpp"
+#include <boost/system/error_code.hpp>
+#include "boost/asio/as_tuple.hpp"
+#include "boost/asio/experimental/awaitable_operators.hpp"
+
+// WebSocket support
+#include "boost/beast/core.hpp"
+#include "boost/beast/http.hpp"
+#include "boost/beast/websocket.hpp"
 
 #include "fmt/core.h"
 
@@ -11,16 +17,22 @@
 #include "hash.h"
 #include "proto.h"
 
-using asio::ip::tcp;
-using asio::ip::udp;
+using boost::asio::ip::tcp;
+using boost::asio::ip::udp;
 
-using asio::co_spawn;
-using asio::detached;
-using asio::awaitable;
-using asio::experimental::as_tuple_t;
-constexpr auto use_await = asio::experimental::as_tuple(asio::use_awaitable);
-namespace this_coro = asio::this_coro;
-using namespace asio::experimental::awaitable_operators;
+using boost::asio::co_spawn;
+using boost::asio::detached;
+using boost::asio::awaitable;
+using boost::asio::as_tuple_t;
+using boost::system::error_code;
+constexpr auto use_await = boost::asio::as_tuple(boost::asio::use_awaitable);
+namespace this_coro = boost::asio::this_coro;
+using namespace boost::asio::experimental::awaitable_operators;
+
+// Beast aliases
+namespace beast = boost::beast;
+namespace http = beast::http;
+namespace websocket = beast::websocket;
 
 using ec::EC;
 using buffer::Slice;
@@ -39,7 +51,7 @@ namespace common {
         
         while (read_times-- != 0) {
             auto [ec, n] = co_await stream.async_read_some(
-                asio::buffer(buf.data() + read_n, buf.size() - read_n),
+                boost::asio::buffer(buf.data() + read_n, buf.size() - read_n),
                 use_await);
             
             // read err or eof
@@ -62,7 +74,7 @@ namespace common {
     awaitable<int> read_exact(_Stream& stream, Slice<uint8_t> buf) noexcept {
         while (buf.size() > 0) {
             auto [ec, n] = co_await stream.async_read_some(
-                asio::buffer(buf.data(), buf.size()),
+                boost::asio::buffer(buf.data(), buf.size()),
                 use_await);
             
             // read error
@@ -78,7 +90,7 @@ namespace common {
     awaitable<int> write_all(_Stream& stream, Slice<const uint8_t> buf) noexcept {
         while (buf.size() > 0) {
             auto [ec, n] = co_await stream.async_write_some(
-                asio::buffer(buf.data(), buf.size()),
+                boost::asio::buffer(buf.data(), buf.size()),
                 use_await);
 
             // write err
@@ -89,15 +101,49 @@ namespace common {
         co_return EC::Ok;
     }
 
+    // WebSocket write function
+    template<typename _WebSocket>
+    awaitable<int> websocket_write_all(_WebSocket& ws, Slice<const uint8_t> buf) noexcept {
+        auto [ec, n] = co_await ws.async_write(
+            boost::asio::buffer(buf.data(), buf.size()),
+            use_await);
+        
+        if (ec) [[unlikely]] { co_return -EC::ErrWrite; }
+        co_return EC::Ok;
+    }
+
+    // WebSocket read function
+    template<typename _WebSocket>
+    awaitable<int> websocket_read_some(_WebSocket& ws, Slice<uint8_t> buf) noexcept {
+        beast::flat_buffer buffer;
+        auto [ec, bytes_read] = co_await ws.async_read(buffer, use_await);
+        
+        if (ec) [[unlikely]] { co_return -EC::ErrRead; }
+        
+        auto data = buffer.data();
+        size_t copy_size = std::min(buf.size(), data.size());
+        std::memcpy(buf.data(), data.data(), copy_size);
+        
+        co_return copy_size;
+    }
+
     // Shutdown socket.
     template<typename Stream>
     awaitable<void> async_shutdown(Stream& socket) noexcept { co_return; }
 
     template<>
     awaitable<void> async_shutdown(tcp::socket& socket) noexcept {
-        std::error_code ec;
+        boost::system::error_code ec;
         socket.cancel(ec);
         socket.shutdown(tcp::socket::shutdown_send, ec);
+        co_return;
+    }
+
+    // WebSocket shutdown
+    template<typename WebSocket>
+    awaitable<void> websocket_shutdown(WebSocket& ws) noexcept {
+        boost::system::error_code ec;
+	co_await ws.async_close(websocket::close_code::normal, use_await);
         co_return;
     }
 
@@ -106,7 +152,7 @@ namespace common {
     awaitable<void> forward(_Stream1& a, _Stream2& b, Slice<uint8_t> buf) noexcept {
         while(true) {
             auto [ec, n] = co_await a.async_read_some(
-                asio::buffer(buf.data(), buf.size()),
+                boost::asio::buffer(buf.data(), buf.size()),
                 use_await);
 
             // read err or eof
@@ -116,6 +162,37 @@ namespace common {
             }
 
             if (co_await write_all(b, buf.slice_until(n)) < 0) [[unlikely]] { co_return; }
+        }
+    }
+
+    // Forward from WebSocket to TCP
+    template<typename _WebSocket, typename _Stream>
+    awaitable<void> websocket_to_tcp(_WebSocket& ws, _Stream& tcp, Slice<uint8_t> buf) noexcept {
+        while(true) {
+            auto n = co_await websocket_read_some(ws, buf);
+            if (n <= 0) [[unlikely]] {
+                co_await async_shutdown(tcp);
+                co_return;
+            }
+
+            if (co_await write_all(tcp, buf.slice_until(n)) < 0) [[unlikely]] { co_return; }
+        }
+    }
+
+    // Forward from TCP to WebSocket
+    template<typename _Stream, typename _WebSocket>
+    awaitable<void> tcp_to_websocket(_Stream& tcp, _WebSocket& ws, Slice<uint8_t> buf) noexcept {
+        while(true) {
+            auto [ec, n] = co_await tcp.async_read_some(
+                boost::asio::buffer(buf.data(), buf.size()),
+                use_await);
+
+            if (ec || n <= 0) [[unlikely]] {
+                co_await websocket_shutdown(ws);
+                co_return;
+            }
+
+            if (co_await websocket_write_all(ws, buf.slice_until(n)) < 0) [[unlikely]] { co_return; }
         }
     }
 
@@ -147,6 +224,97 @@ namespace common {
     }
 }
 
+namespace websocket_server_impl {
+    using trojan::Request;
+    using service::Server;
+    using common::read_exact;
+    using common::read_until_parsed;
+    using common::write_all;
+    using common::websocket_write_all;
+    using common::websocket_read_some;
+    using common::websocket_to_tcp;
+    using common::tcp_to_websocket;
+    using common::resolve_addr;
+
+    awaitable<void> handle_websocket(Server& server, tcp::socket stream) noexcept {
+
+        // Create WebSocket stream and accept handshake
+        websocket::stream<tcp::socket> ws(std::move(stream));
+        
+        // Accept WebSocket handshake
+        auto [ec] = co_await ws.async_accept(use_await);
+        if (ec) {
+            fmt::print("WebSocket handshake failed: {}\n", ec.message());
+            co_return;
+        }
+
+        fmt::print("WebSocket connection established\n");
+
+        // Set binary mode for data transfer
+        ws.binary(true);
+
+        tcp::socket remote_stream(ws.get_executor());
+        boost::system::error_code sock_ec;
+
+        Request request;
+        Buffer<uint8_t> buffer1;
+        Buffer<uint8_t> buffer2;
+
+        // Read trojan request from WebSocket
+        auto n = co_await websocket_read_some(ws, buffer1.slice());
+        if (n <= 0) {
+            fmt::print("Failed to read trojan request from WebSocket\n");
+            co_return;
+        }
+
+        auto decode_n = request.decode(buffer1.slice_until(n));
+        if (decode_n < 0) {
+            fmt::print("Invalid trojan request from WebSocket\n");
+            co_return;
+        }
+
+        // Check password
+        if (std::memcmp(request.password.data(), server.password.data(), server.password.size())) {
+            fmt::print("Incorrect password from WebSocket client\n");
+            co_return;
+        }
+
+        // Handle TCP connection (UDP not supported over WebSocket in this example)
+        if (request.cmd != trojan::CMD::CONNECT) {
+            fmt::print("Only TCP CONNECT supported over WebSocket\n");
+            co_return;
+        }
+
+        // Connect to remote
+        tcp::endpoint remote_addr;
+        if (co_await resolve_addr(server.tcp_resolver, request.addr, &remote_addr) < 0) {
+            fmt::print("Resolve error for WebSocket request\n");
+            co_return;
+        }
+
+        auto [econn] = co_await remote_stream.async_connect(remote_addr, use_await);
+        if (econn) {
+            fmt::print("Connect to remote error from WebSocket: {}\n", econn.message());
+            co_return;
+        }
+
+        // Write any remaining data from initial request
+        if (decode_n < n) {
+            if (co_await write_all(remote_stream, buffer1.slice(decode_n, n)) < 0) {
+                co_return;
+            }
+        }
+
+        fmt::print("Starting WebSocket bidirectional forwarding\n");
+
+        // Bidirectional forwarding between WebSocket and remote TCP
+        co_await(
+            websocket_to_tcp(ws, remote_stream, buffer1.slice()) ||
+            tcp_to_websocket(remote_stream, ws, buffer2.slice())
+        );
+    }
+}
+
 namespace trojan_server_impl {
     using trojan::Request;
     using service::Server;
@@ -159,14 +327,14 @@ namespace trojan_server_impl {
 #if defined(TROJAN_USE_UDP)
     awaitable<void> handle_udp(
         Server& server,
-        tcp::socket& tcp_stream,  // Changed from ssl_socket to tcp::socket
+        tcp::socket& tcp_stream,
         Slice<uint8_t> buf1, Slice<uint8_t> buf2,
         int offset
     ) noexcept {
         udp::socket udp_socket(tcp_stream.get_executor());
         // first packet
         {
-            std::error_code ec;
+            boost::system::error_code ec;
             trojan::UdpPacket pkt_hdr;
             udp::endpoint remote_addr;
             // atyp + addr[0]
@@ -210,11 +378,10 @@ namespace trojan_server_impl {
 
             // send udp packet
             auto [ec2, send_n] = co_await udp_socket.async_send_to(
-                asio::buffer(buf1.data(), pkt_hdr.length),
+                boost::asio::buffer(buf1.data(), pkt_hdr.length),
                 remote_addr, use_await);
             if (ec2) { co_return; }
         }
-
 
         auto udp_to_tcp = [&tcp_stream, &udp_socket, buf2]() -> awaitable<void> {
             udp::endpoint addr;
@@ -223,7 +390,7 @@ namespace trojan_server_impl {
             while (true) {
                 // read from remote
                 auto [ec, recv_n] = co_await udp_socket.async_receive_from(
-                    asio::buffer(buf2.data(), buf2.size()),
+                    boost::asio::buffer(buf2.data(), buf2.size()),
                     addr, use_await);
                 if (ec) { co_return; }
 
@@ -274,7 +441,7 @@ namespace trojan_server_impl {
 
                 // send udp packet
                 auto [ec, send_n] = co_await udp_socket.async_send_to(
-                    asio::buffer(buf1.data(), pkt_hdr.length),
+                    boost::asio::buffer(buf1.data(), pkt_hdr.length),
                     remote_addr, use_await);
                 if (ec) { co_return; }
             }
@@ -285,68 +452,8 @@ namespace trojan_server_impl {
 #endif
 
     awaitable<void> handle(Server& server, tcp::socket stream) noexcept {
-        tcp::socket remote_stream(stream.get_executor());
-        std::error_code ec;
-        stream.set_option(tcp::no_delay(true), ec);
-        remote_stream.set_option(tcp::no_delay(true), ec);
-
-        Request request;
-        Buffer<uint8_t> buffer1;
-        Buffer<uint8_t> buffer2;
-
-        // No SSL handshake needed - direct TCP communication
-        
-        // trojan request - read directly from TCP stream
-        auto [parsed_n, read_n] = co_await read_until_parsed(stream, buffer1.slice(), &request, 1);
-        if (parsed_n < 0) [[unlikely]] {
-            fmt::print("invalid trojan request\n");
-            co_return;
-        }
-
-        // check passwd
-        if (std::memcmp(request.password.data(), server.password.data(), server.password.size())) {
-            fmt::print("incorrect password\n");
-            co_return;
-        }
-
-        // ####################
-        // goto udp
-        if (request.cmd == trojan::CMD::ASSOCIATE) [[unlikely]] {
-#if defined(TROJAN_USE_UDP)
-            size_t len = read_n - parsed_n;
-            if (len > 0) {
-                std::memcpy(buffer1.data(), buffer1.data() + parsed_n, len);
-            }
-            co_await handle_udp(server, stream, buffer1.slice(), buffer2.slice(), len);
-#endif
-            co_return;
-        }
-        // ####################
-
-        // handle tcp
-
-        // connect to remote
-        tcp::endpoint remote_addr;
-        if (co_await resolve_addr(server.tcp_resolver, request.addr, &remote_addr) < 0) [[unlikely]] {
-            fmt::print("resolve error\n");
-            co_return;
-        };
-        auto [econn] = co_await remote_stream.async_connect(remote_addr, use_await);
-        if (econn) {
-            fmt::print("connect to remote error: {}\n", econn.message());
-            co_return;
-        }
-
-        // write left (n, m) bytes
-        if (co_await write_all(remote_stream, buffer1.slice(parsed_n, read_n)) < 0) [[unlikely]] {
-            co_return;
-        };
-
-        // bidi copy - forward data between client TCP stream and remote stream
-        co_await(
-            forward(stream, remote_stream, buffer1.slice()) ||
-            forward(remote_stream, stream, buffer2.slice())
-        );
+        // Directly handle as WebSocket connection
+        co_await websocket_server_impl::handle_websocket(server, std::move(stream));
     }
 }
 
@@ -358,8 +465,8 @@ namespace service_impl {
         while(true) {
             auto [ec, stream] = co_await provider.listen.async_accept(use_await);
 
-            if (ec) [[unlikely]] {
-                fmt::print("failed to accept: {}\n", ec.message());
+            if (ec) {
+                fmt::print("Failed to accept: {}\n", ec.message());
                 break;
             }
 
@@ -369,29 +476,29 @@ namespace service_impl {
 }
 
 namespace service {
-    // Launch a server.
+    // Launch a server with WebSocket support.
     awaitable<void> run_server(Server server) noexcept {
         using service_impl::run_service;
         using trojan_server_impl::handle;
         co_await run_service(std::move(server), handle);
     }
 
-    // Setup a server, no SSL context needed
+    // Setup a server
     Server build_server(io_context& ctx, ServerConfig config) {
         tcp::resolver resolver(ctx);
-        tcp::endpoint listen_addr = *resolver.resolve(config.host, config.port);
+	auto results = resolver.resolve(config.host, config.port);
+        tcp::endpoint listen_addr = *results.begin();
         tcp::acceptor listener(ctx, listen_addr);
 
         listener.set_option(tcp::acceptor::reuse_address(true));
 
         auto password = hash::sha224((uint8_t*)config.password.data(), config.password.size());
 
-        // No SSL context needed for plaintext TCP
         return Server {
             std::move(listener),
             std::move(resolver),
             udp::resolver(ctx),
-            password  // Removed SSL context parameter
+            password
         };
     }
 }

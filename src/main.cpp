@@ -4,9 +4,10 @@
 
 #include <unistd.h>
 #include <string_view>
+namespace asio = boost::asio;
 
 using std::string_view;
-using asio::io_context;
+using boost::asio::io_context;
 using conf::ServerConfig;
 
 constexpr string_view VERSION = "v0.1.2";

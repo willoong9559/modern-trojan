@@ -52,8 +52,9 @@ namespace unix_sys {
     }
 
     inline void set_nofile_limit(std::size_t nofile) noexcept {
-        const rlimit limit = {nofile, nofile};
-        int ret = setrlimit(RLIMIT_NOFILE, &limit);
+        //const rlimit limit = {nofile, nofile};
+	const rlimit limit = { static_cast<rlim_t>(nofile), static_cast<rlim_t>(nofile) };
+	int ret = setrlimit(RLIMIT_NOFILE, &limit);
         if (ret < 0) {
             fmt::print("failed to set fd limit to {}\n", nofile);
         } else {
