@@ -50,7 +50,7 @@ Install dependencies with `vcpkg`:
 git clone https://github.com/microsoft/vcpkg
 vcpkg/bootstrap-vcpkg.sh
 vcpkg/vcpkg integrate install
-vcpkg/vcpkg install asio
+vcpkg/vcpkg install boost-asio
 vcpkg/vcpkg install fmt
 vcpkg/vcpkg install range-v3
 ```
